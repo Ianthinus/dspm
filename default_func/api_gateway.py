@@ -50,6 +50,9 @@ def start_scan():
     try:
         data = request.get_json()
         
+        # 스캔 시작 전에 기존 자산 데이터 삭제
+        clear_existing_assets()
+        
         # Discovery Service에 스캔 요청 전달
         response = requests.post(f'{DISCOVERY_SERVICE_URL}/discover', json=data)
         
@@ -70,6 +73,35 @@ def start_scan():
         else:
             return jsonify({'success': False, 'error': 'Discovery service error'})
             
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+def clear_existing_assets():
+    """기존 자산 데이터 모두 삭제"""
+    try:
+        conn = sqlite3.connect('dspm_gateway.db')
+        cursor = conn.cursor()
+        
+        # 모든 자산 데이터 삭제
+        cursor.execute('DELETE FROM assets')
+        
+        # 스캔 작업 히스토리도 정리 (선택사항)
+        cursor.execute('DELETE FROM scan_jobs WHERE status != "started"')
+        
+        conn.commit()
+        conn.close()
+        
+        print("기존 자산 데이터가 초기화되었습니다.")
+        
+    except Exception as e:
+        print(f"자산 데이터 초기화 실패: {e}")
+
+@gateway_app.route('/api/assets/clear', methods=['POST'])
+def clear_assets_manual():
+    """수동으로 자산 데이터 초기화"""
+    try:
+        clear_existing_assets()
+        return jsonify({'success': True, 'message': '자산 데이터가 초기화되었습니다.'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
@@ -184,20 +216,22 @@ def get_s3_objects_by_bucket(bucket_name):
 
 @gateway_app.route('/api/assets/save', methods=['POST'])
 def save_assets():
-    """Discovery Service에서 발견된 자산 저장 (S3 객체 포함)"""
+    """Discovery Service에서 발견된 자산 저장"""
     try:
         data = request.get_json()
         assets = data.get('assets', [])
+        scan_id = data.get('scan_id', '')
         
         conn = sqlite3.connect('dspm_gateway.db')
         cursor = conn.cursor()
         
         buckets_count = 0
         objects_count = 0
+        other_count = 0
         
         for asset in assets:
             cursor.execute('''
-                INSERT OR REPLACE INTO assets 
+                INSERT INTO assets 
                 (asset_id, asset_type, name, region, metadata, updated_at)
                 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ''', (
@@ -213,6 +247,18 @@ def save_assets():
                 buckets_count += 1
             elif asset['asset_type'] == 'S3 Object':
                 objects_count += 1
+            else:
+                other_count += 1
+        
+        # 스캔 작업 상태 업데이트
+        if scan_id:
+            cursor.execute('''
+                UPDATE scan_jobs 
+                SET status = 'completed', 
+                    assets_found = ?, 
+                    completed_at = CURRENT_TIMESTAMP
+                WHERE scan_id = ?
+            ''', (len(assets), scan_id))
         
         conn.commit()
         conn.close()
@@ -221,7 +267,8 @@ def save_assets():
             'success': True, 
             'saved_count': len(assets),
             'buckets': buckets_count,
-            'objects': objects_count
+            'objects': objects_count,
+            'other_assets': other_count
         })
         
     except Exception as e:
