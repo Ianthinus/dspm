@@ -1,4 +1,3 @@
-
 # 3. Discovery Service (스캔 전용) - discovery_service.py
 from flask import Flask, request, jsonify
 import boto3
@@ -10,7 +9,7 @@ import threading
 discovery_app = Flask(__name__)
 
 class AWSDiscoveryService:
-    def __init__(self, access_key, secret_key, region='ap-northeast-2'):
+    def __init__(self, access_key, secret_key, region='us-east-1'):
         self.session = boto3.Session(
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
@@ -29,8 +28,10 @@ class AWSDiscoveryService:
         except Exception as e:
             raise Exception(f"AWS 발견 실패: {str(e)}")
     
+    # discovery_service.py의 수정된 discover_s3_buckets 메서드
+
     def discover_s3_buckets(self):
-        """S3 버킷 발견"""
+        """S3 버킷 및 내부 객체 발견"""
         try:
             s3 = self.session.client('s3')
             buckets = s3.list_buckets()
@@ -59,18 +60,85 @@ class AWSDiscoveryService:
                 except:
                     metadata['is_public'] = True
                 
-                asset = {
+                # 버킷 자산 추가
+                bucket_asset = {
                     'asset_id': f"s3://{bucket_name}",
                     'asset_type': 'S3 Bucket',
                     'name': bucket_name,
                     'region': metadata.get('region', self.region),
                     'metadata': metadata
                 }
+                self.assets.append(bucket_asset)
                 
-                self.assets.append(asset)
-                
+                # 버킷 내부 객체들 스캔
+                try:
+                    self.scan_bucket_objects(s3, bucket_name)
+                except Exception as e:
+                    print(f"버킷 {bucket_name} 객체 스캔 실패: {e}")
+                    
         except Exception as e:
             print(f"S3 스캔 실패: {e}")
+
+    def scan_bucket_objects(self, s3, bucket_name, max_objects=500):
+        """S3 버킷 내부 객체들을 개별 자산으로 추가"""
+        try:
+            response = s3.list_objects_v2(
+                Bucket=bucket_name,
+                MaxKeys=max_objects
+            )
+            
+            if 'Contents' in response:
+                for obj in response['Contents']:
+                    key = obj['Key']
+                    size = obj['Size']
+                    last_modified = obj['LastModified']
+                    
+                    # 객체 메타데이터 (단순 식별 정보만)
+                    obj_metadata = {
+                        'bucket': bucket_name,
+                        'key': key,
+                        'size_bytes': size,
+                        'size_readable': self.format_file_size(size),
+                        'last_modified': last_modified.isoformat(),
+                        'service': 's3'
+                    }
+                    
+                    # 파일 확장자
+                    if '.' in key:
+                        obj_metadata['file_extension'] = key.split('.')[-1].lower()
+                    
+                    # 폴더 경로
+                    if '/' in key:
+                        obj_metadata['folder_path'] = '/'.join(key.split('/')[:-1])
+                        obj_metadata['file_name'] = key.split('/')[-1]
+                    else:
+                        obj_metadata['file_name'] = key
+                    
+                    # S3 객체를 개별 자산으로 추가
+                    object_asset = {
+                        'asset_id': f"s3://{bucket_name}/{key}",
+                        'asset_type': 'S3 Object',
+                        'name': obj_metadata['file_name'],
+                        'region': self.region,
+                        'metadata': obj_metadata
+                    }
+                    
+                    self.assets.append(object_asset)
+                    
+        except Exception as e:
+            print(f"객체 스캔 오류: {e}")
+
+    def format_file_size(self, size_bytes):
+        """바이트를 읽기 쉬운 형태로 변환"""
+        if size_bytes == 0:
+            return "0 B"
+        
+        size_names = ["B", "KB", "MB", "GB", "TB"]
+        import math
+        i = int(math.floor(math.log(size_bytes, 1024)))
+        p = math.pow(1024, i)
+        s = round(size_bytes / p, 2)
+        return f"{s} {size_names[i]}"
     
     def discover_rds_instances(self):
         """RDS 인스턴스 발견"""
@@ -188,6 +256,10 @@ def start_discovery():
         
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
+
+@discovery_app.route('/health')
+def health_check():
+    return jsonify({'status': 'healthy', 'service': 'discovery'})
 
 if __name__ == '__main__':
     discovery_app.run(host='0.0.0.0', port=9000, debug=True)

@@ -90,6 +90,7 @@ def get_asset_stats():
         return jsonify({
             'total': total,
             's3_buckets': type_counts.get('S3 Bucket', 0),
+            's3_objects': type_counts.get('S3 Object', 0),
             'rds_instances': type_counts.get('RDS Instance', 0),
             'ec2_instances': type_counts.get('EC2 Instance', 0)
         })
@@ -100,25 +101,46 @@ def get_asset_stats():
 @gateway_app.route('/api/assets/list')
 def get_asset_list():
     try:
+        asset_type = request.args.get('type', 'all')
+        limit = int(request.args.get('limit', 100))
+        
         conn = sqlite3.connect('dspm_gateway.db')
         cursor = conn.cursor()
         
-        cursor.execute('''
-            SELECT asset_id, asset_type, name, region, metadata
-            FROM assets
-            ORDER BY updated_at DESC
-            LIMIT 50
-        ''')
+        if asset_type == 'all':
+            cursor.execute('''
+                SELECT asset_id, asset_type, name, region, metadata
+                FROM assets
+                ORDER BY asset_type, name
+                LIMIT ?
+            ''', (limit,))
+        else:
+            cursor.execute('''
+                SELECT asset_id, asset_type, name, region, metadata
+                FROM assets
+                WHERE asset_type = ?
+                ORDER BY name
+                LIMIT ?
+            ''', (asset_type, limit))
         
         assets = []
         for row in cursor.fetchall():
-            assets.append({
+            metadata = json.loads(row[4]) if row[4] else {}
+            asset = {
                 'asset_id': row[0],
                 'asset_type': row[1],
                 'name': row[2],
                 'region': row[3],
-                'metadata': json.loads(row[4]) if row[4] else {}
-            })
+                'metadata': metadata
+            }
+            
+            # S3 객체의 경우 추가 정보 표시
+            if row[1] == 'S3 Object':
+                asset['bucket'] = metadata.get('bucket', '')
+                asset['size'] = metadata.get('size_readable', '')
+                asset['file_extension'] = metadata.get('file_extension', '')
+            
+            assets.append(asset)
         
         conn.close()
         return jsonify({'assets': assets})
@@ -126,15 +148,52 @@ def get_asset_list():
     except Exception as e:
         return jsonify({'error': str(e)})
 
+@gateway_app.route('/api/assets/s3-objects/<bucket_name>')
+def get_s3_objects_by_bucket(bucket_name):
+    """특정 S3 버킷의 객체들만 조회"""
+    try:
+        conn = sqlite3.connect('dspm_gateway.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT asset_id, name, metadata
+            FROM assets
+            WHERE asset_type = "S3 Object" 
+            AND json_extract(metadata, '$.bucket') = ?
+            ORDER BY name
+        ''', (bucket_name,))
+        
+        objects = []
+        for row in cursor.fetchall():
+            metadata = json.loads(row[2]) if row[2] else {}
+            objects.append({
+                'asset_id': row[0],
+                'name': row[1],
+                'key': metadata.get('key', ''),
+                'size': metadata.get('size_readable', ''),
+                'last_modified': metadata.get('last_modified', ''),
+                'file_extension': metadata.get('file_extension', ''),
+                'folder_path': metadata.get('folder_path', '')
+            })
+        
+        conn.close()
+        return jsonify({'bucket': bucket_name, 'objects': objects, 'count': len(objects)})
+        
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
 @gateway_app.route('/api/assets/save', methods=['POST'])
 def save_assets():
-    """Discovery Service에서 발견된 자산 저장"""
+    """Discovery Service에서 발견된 자산 저장 (S3 객체 포함)"""
     try:
         data = request.get_json()
         assets = data.get('assets', [])
         
         conn = sqlite3.connect('dspm_gateway.db')
         cursor = conn.cursor()
+        
+        buckets_count = 0
+        objects_count = 0
         
         for asset in assets:
             cursor.execute('''
@@ -148,11 +207,22 @@ def save_assets():
                 asset['region'],
                 json.dumps(asset.get('metadata', {}))
             ))
+            
+            # 카운트
+            if asset['asset_type'] == 'S3 Bucket':
+                buckets_count += 1
+            elif asset['asset_type'] == 'S3 Object':
+                objects_count += 1
         
         conn.commit()
         conn.close()
         
-        return jsonify({'success': True, 'saved_count': len(assets)})
+        return jsonify({
+            'success': True, 
+            'saved_count': len(assets),
+            'buckets': buckets_count,
+            'objects': objects_count
+        })
         
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
